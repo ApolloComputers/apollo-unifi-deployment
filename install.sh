@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
 # ============================================================
 # Apollo Computers - UniFi OS Server + Datto RMM Deployment
-# Version 2.7
+# Version 2.8
 # Supported OS: Ubuntu Server 24.04 LTS (x86_64)
 # ============================================================
 
 set -Eeuo pipefail
+umask 077
 
-VERSION="2.7"
+VERSION="2.8"
 UNIFI_VERSION="5.1.42"
 
 UNIFI_URL="https://fw-download.ubnt.com/data/unifi-os-server/5172-linux-x64-5.1.42-12e9e3cf-8f8b-4e54-928c-76b80a10c8a4.42-x64"
@@ -16,8 +17,10 @@ WORKDIR="/opt/apollo-unifi"
 LOG="/var/log/apollo-unifi-deployment.log"
 
 STEP="Startup"
+
 UNIFI_STATUS="NOT RUN"
 RMM_STATUS="NOT RUN"
+
 FAILURES=0
 
 CLIENT=""
@@ -66,7 +69,7 @@ exec > >(tee -a "$LOG") 2>&1
 # ERROR HANDLING
 # ============================================================
 
-trap 'error "Unexpected error at line $LINENO (exit code $?). Command: $BASH_COMMAND"' ERR
+trap 'rc=$?; error "Unexpected error at line $LINENO (exit code $rc). Step: $STEP"' ERR
 
 fatal() {
     error "$*"
@@ -138,7 +141,8 @@ printf 'Interface: %s\n' "$IFACE"
 printf 'Current IP: %s\n' "$IP"
 printf 'Network: Existing Ubuntu configuration\n'
 
-# No confirmation prompt. Continue automatically.
+# Networking was configured during Ubuntu installation.
+# Do not modify it or request confirmation.
 
 command -v curl >/dev/null 2>&1 ||
     fatal "curl is required."
@@ -315,7 +319,17 @@ install_unifi() {
 
 install_rmm() {
 
+    local rmm_url=""
+    local rmm_installer=""
+    local download_status=0
+    local install_status=0
+    local attempt=0
+
     info "Checking Datto RMM installation..."
+
+    # --------------------------------------------------------
+    # CHECK FOR EXISTING AGENT
+    # --------------------------------------------------------
 
     if systemctl is-active --quiet cag.service; then
 
@@ -336,6 +350,8 @@ install_rmm() {
         if systemctl is-active --quiet cag.service; then
 
             pass "Datto RMM service started."
+            info "Confirm device enrollment in Datto RMM console."
+
             return 0
 
         fi
@@ -345,44 +361,158 @@ install_rmm() {
 
     fi
 
+    # --------------------------------------------------------
+    # REQUEST CLIENT-SPECIFIC INSTALLER URL
+    # --------------------------------------------------------
+
     printf '\n'
-    printf 'Datto RMM requires an approved Linux installer.\n'
-    printf 'Do not store Datto enrollment credentials in public GitHub.\n'
+    printf '==================================================\n'
+    printf ' DATTO RMM INSTALLATION\n'
+    printf '==================================================\n'
+    printf '\n'
+    printf 'Open the client site in Datto RMM.\n'
+    printf 'Copy the Linux agent download URL.\n'
+    printf '\n'
+    printf 'Paste ONLY the URL, not the entire wget command.\n'
+    printf '\n'
+    printf 'Press Enter without a URL to skip installation.\n'
+    printf '\n'
 
-    local rmm_file
+    # Read silently so the URL is not echoed into the log.
+    # The URL may contain a site-specific enrollment identifier.
 
-    read -r -p \
-        "Local path to approved Datto Linux installer (Enter to skip): " \
-        rmm_file
+    read -r -s -p "Datto RMM URL (input hidden): " rmm_url
+    printf '\n'
 
-    if [[ -z "$rmm_file" ]]; then
+    if [[ -z "$rmm_url" ]]; then
 
         warn "Datto RMM installation skipped."
         return 2
 
     fi
 
-    if [[ ! -f "$rmm_file" ]]; then
+    # --------------------------------------------------------
+    # VALIDATE URL
+    # --------------------------------------------------------
 
-        error "Datto installer not found: $rmm_file"
+    info "Validating Datto RMM installer URL..."
+
+    # Accept HTTPS download-agent URLs from Datto RMM hosts.
+    # Reject commands, spaces, query strings, and redirects
+    # to unrelated domains.
+
+    if [[ ! "$rmm_url" =~ ^https://[a-zA-Z0-9-]+\.rmm\.datto\.com/download-agent/linux/[a-zA-Z0-9-]+/?$ ]]; then
+
+        error "Invalid Datto RMM installer URL."
+        error "Copy only the Linux download URL from Datto RMM."
+
+        unset rmm_url
         return 1
 
     fi
 
-    info "Installing Datto RMM..."
+    pass "Datto RMM URL format validated."
 
-    bash "$rmm_file" || return 1
+    # --------------------------------------------------------
+    # DOWNLOAD INSTALLER
+    # --------------------------------------------------------
 
-    if systemctl is-active --quiet cag.service; then
+    rmm_installer="$(mktemp /tmp/apollo-datto-rmm.XXXXXXXX.sh)" || {
+        error "Unable to create temporary installer file."
+        return 1
+    }
 
-        pass "Datto RMM service running."
-        info "Confirm the device appears in the Datto RMM console."
+    chmod 600 "$rmm_installer"
 
-        return 0
+    info "Downloading Datto RMM Linux installer..."
+
+    # Avoid printing site-specific URLs in the deployment log.
+    # Do not follow redirects to arbitrary destinations.
+
+    curl \
+        --fail \
+        --silent \
+        --show-error \
+        --proto '=https' \
+        --connect-timeout 30 \
+        --max-time 180 \
+        --retry 3 \
+        --output "$rmm_installer" \
+        "$rmm_url" >/dev/null 2>&1 || download_status=$?
+
+    unset rmm_url
+
+    if (( download_status != 0 )); then
+
+        error "Datto RMM installer download failed."
+        error "Curl exit code: $download_status"
+
+        rm -f "$rmm_installer"
+        return 1
 
     fi
 
-    error "Datto RMM service is not running after installation."
+    if [[ ! -s "$rmm_installer" ]]; then
+
+        error "Downloaded Datto RMM installer is empty."
+
+        rm -f "$rmm_installer"
+        return 1
+
+    fi
+
+    pass "Datto RMM installer downloaded."
+
+    # --------------------------------------------------------
+    # INSTALL AGENT
+    # --------------------------------------------------------
+
+    info "Installing Datto RMM agent..."
+
+    # Datto provides a shell installer.
+    # Suppress installer output to avoid leaking enrollment
+    # information into the public terminal or deployment log.
+
+    sh "$rmm_installer" >/dev/null 2>&1 || install_status=$?
+
+    # Remove the downloaded installer regardless of result.
+
+    rm -f "$rmm_installer"
+
+    if (( install_status != 0 )); then
+
+        error "Datto RMM installer failed."
+        error "Installer exit code: $install_status"
+
+        return 1
+
+    fi
+
+    pass "Datto RMM installer completed."
+
+    # --------------------------------------------------------
+    # VERIFY AGENT SERVICE
+    # --------------------------------------------------------
+
+    info "Waiting for Datto RMM service..."
+
+    for ((attempt=1; attempt<=30; attempt++)); do
+
+        if systemctl is-active --quiet cag.service; then
+
+            pass "Datto RMM service is running."
+            info "Confirm the device appears in the Datto RMM console."
+
+            return 0
+
+        fi
+
+        sleep 2
+
+    done
+
+    error "Datto RMM service did not become active."
+    error "Check service status: sudo systemctl status cag.service"
 
     return 1
 }
