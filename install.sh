@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # Apollo Computers - UniFi OS Server Deployment
-# Version 2.4: use Ubuntu's preconfigured network; never modify Netplan.
+# Version 2.5: idempotent install, container and HTTPS readiness checks.
 # Target: Ubuntu Server 24.04 LTS x86_64
 set -Eeuo pipefail
 
-VERSION="2.4"
+VERSION="2.5"
 UNIFI_VERSION="5.1.42"
 UNIFI_URL="https://fw-download.ubnt.com/data/unifi-os-server/5172-linux-x64-5.1.42-12e9e3cf-8f8b-4e54-928c-76b80a10c8a4.42-x64"
 SESSION="apollo-deploy"
@@ -82,36 +82,66 @@ else
     pass "Keeping existing hostname $HOST."
 fi
 
-info "Installing UniFi dependencies..."
-export DEBIAN_FRONTEND=noninteractive
-apt-get update
-apt-get install -y curl wget ca-certificates gnupg podman slirp4netns uidmap dbus-user-session
-install -d -m 755 "$WORKDIR"
-INSTALLER="$WORKDIR/unifi-os-server-installer"
-info "Downloading UniFi OS Server $UNIFI_VERSION..."
-curl -fL --retry 3 --connect-timeout 30 "$UNIFI_URL" -o "$INSTALLER"
-[[ -s "$INSTALLER" ]] || fail "UniFi installer download was empty."
-chmod 755 "$INSTALLER"
-info "Running Ubiquiti installer (vendor confirmation may be required)..."
-"$INSTALLER"
+# Service presence is the reliable installation signal here. The vendor's
+# service binary must NOT be invoked with --version: it starts another instance.
+# An existing installation is preserved regardless of its unknown version.
+INSTALLED=false
+if systemctl cat uosserver.service >/dev/null 2>&1 && \
+   systemctl cat uosserver-updater.service >/dev/null 2>&1; then
+    INSTALLED=true
+    pass "Existing UniFi OS Server installation detected; skipping installer."
+    info "Installed version not independently verified; no upgrade attempted."
+fi
+
+if [[ "$INSTALLED" == false ]]; then
+    # An incomplete installation must be reviewed, not overwritten blindly.
+    if systemctl cat uosserver.service >/dev/null 2>&1 || \
+       systemctl cat uosserver-updater.service >/dev/null 2>&1; then
+        fail "Partial UniFi service installation detected. Review before retrying."
+    fi
+    info "Installing UniFi dependencies..."
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update
+    apt-get install -y curl wget ca-certificates gnupg podman slirp4netns uidmap dbus-user-session
+    install -d -m 755 "$WORKDIR"
+    INSTALLER="$WORKDIR/unifi-os-server-installer"
+    info "Downloading UniFi OS Server $UNIFI_VERSION..."
+    curl -fL --retry 3 --connect-timeout 30 "$UNIFI_URL" -o "$INSTALLER"
+    [[ -s "$INSTALLER" ]] || fail "UniFi installer download was empty."
+    chmod 755 "$INSTALLER"
+    info "Running Ubiquiti installer (vendor confirmation may be required)..."
+    "$INSTALLER"
+fi
 
 info "Checking UniFi services..."
-STATUS=0
 for SERVICE in uosserver.service uosserver-updater.service; do
-    if systemctl list-unit-files "$SERVICE" --no-legend | grep -Fq "$SERVICE"; then
-        systemctl enable "$SERVICE"
-        systemctl start "$SERVICE"
-        if systemctl is-active --quiet "$SERVICE"; then
-            pass "$SERVICE is running"
-        else
-            STATUS=1
-            echo "[ERROR] $SERVICE not active"
-        fi
-    else
-        STATUS=1
-        echo "[ERROR] $SERVICE not installed"
-    fi
+    systemctl cat "$SERVICE" >/dev/null 2>&1 || fail "$SERVICE not installed."
+    systemctl enable "$SERVICE"
+    systemctl start "$SERVICE"
+    systemctl is-active --quiet "$SERVICE" || fail "$SERVICE is not running."
+    pass "$SERVICE is active."
 done
+
+# Podman is rootless under the service account, not the root account.
+info "Waiting for UniFi container and HTTPS management interface..."
+READY=false
+for (( attempt=1; attempt<=60; attempt++ )); do
+    CONTAINER_STATE="$(runuser -u uosserver -- sh -c 'cd / && podman inspect --format "{{.State.Running}}" uosserver' 2>/dev/null || true)"
+    HTTP_CODE="$(curl -k -sS -o /dev/null -w '%{http_code}' --connect-timeout 2 --max-time 3 https://127.0.0.1:11443/ 2>/dev/null || true)"
+    if [[ "$CONTAINER_STATE" == true && "$HTTP_CODE" =~ ^[1-5][0-9][0-9]$ ]]; then
+        READY=true
+        break
+    fi
+    sleep 3
+done
+if [[ "$READY" != true ]]; then
+    echo "[ERROR] UniFi container or HTTPS interface not ready after approximately 3 minutes." >&2
+    echo "Check: sudo journalctl -u uosserver.service -n 80 --no-pager" >&2
+    echo "Check: sudo -u uosserver -H sh -c 'cd / && podman ps -a'" >&2
+    fail "UniFi health verification failed. No automatic reinstall attempted."
+fi
+pass "Rootless UniFi container running and HTTPS interface responding (HTTP $HTTP_CODE)."
+
 IP="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") {print $(i+1); exit}}')"
 printf '\n==================================================\n'
 printf ' APOLLO DEPLOYMENT SUMMARY\n'
@@ -120,5 +150,4 @@ printf ' Client: %s\n Hostname: %s\n IP: %s\n' "$CLIENT" "$HOST" "${IP:-not dete
 printf ' Log: %s\n' "$LOG"
 printf '==================================================\n'
 printf 'Remaining: complete UniFi registration, install Datto RMM, verify reboot, adopt devices.\n'
-if (( STATUS != 0 )); then fail "UniFi service verification failed."; fi
 pass "UniFi deployment finished."
