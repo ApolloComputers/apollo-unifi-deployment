@@ -381,7 +381,7 @@ install_rmm() {
     # Read silently so the URL is not echoed into the log.
     # The URL may contain a site-specific enrollment identifier.
 
-    read -r -s -p "Datto RMM URL (input hidden): " rmm_url
+    read -r -s -p "Datto RMM URL (right-click to paste; input hidden): " rmm_url
     printf '\n'
 
     if [[ -z "$rmm_url" ]]; then
