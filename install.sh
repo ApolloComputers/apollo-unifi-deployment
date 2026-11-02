@@ -1,394 +1,177 @@
 #!/usr/bin/env bash
-
-# ==========================================================
-# APOLLO COMPUTERS
-# UNIFI OS SERVER AUTOMATED DEPLOYMENT
-# Version: 2.1 - Persistent Deployment Sessions
-#
-# Supported OS: Ubuntu Server 24.04 LTS
-# Architecture: x86_64
-#
-# Do not store Datto enrollment URLs or passwords here.
-# ==========================================================
-
+# Apollo Computers - UniFi OS Server Deployment
+# Version 2.2 (testing): persistent tmux and timed network recovery
+# Target: Ubuntu 24.04 x86_64
 set -Eeuo pipefail
 
-VERSION="2.1"
+VERSION="2.2"
 UNIFI_VERSION="5.1.42"
-
 UNIFI_URL="https://fw-download.ubnt.com/data/unifi-os-server/5172-linux-x64-5.1.42-12e9e3cf-8f8b-4e54-928c-76b80a10c8a4.42-x64"
+SESSION="apollo-deploy"
+WORKDIR="/opt/apollo-unifi"
+LOG="/var/log/apollo-unifi-deployment.log"
+BACKUP="/var/lib/apollo-unifi/network-backup"
+ROLLBACK="$WORKDIR/network-rollback.sh"
+UNIT="apollo-unifi-network-rollback"
+NEW_CONFIG="/etc/netplan/99-apollo-unifi.yaml"
+MARKER="/run/apollo-unifi-network-confirmed"
 
-INSTALL_DIR="/opt/apollo-unifi"
-LOG_FILE="/var/log/apollo-unifi-deployment.log"
-SESSION_NAME="apollo-deploy"
+info() { printf '\n[INFO] %s\n' "$*"; }
+pass() { printf '[PASS] %s\n' "$*"; }
+fail() { printf '[ERROR] %s\n' "$*" >&2; exit 1; }
 
-info() {
-    echo
-    echo "[INFO] $*"
-}
-
-success() {
-    echo "[PASS] $*"
-}
-
-fail() {
-    echo "[ERROR] $*" >&2
-    exit 1
-}
-
-on_error() {
-    echo "[ERROR] Deployment failed near line $1." >&2
-    echo "Review $LOG_FILE for details." >&2
-}
-
-trap 'on_error "$LINENO"' ERR
-
-# ----------------------------------------------------------
-# Bootstrap persistent tmux session
-# ----------------------------------------------------------
-
+# The technician owns the tmux server; root runs only the deployment.
 if [[ "${1:-}" != "--inside-tmux" ]]; then
-
-    if [[ "$EUID" -ne 0 ]]; then
-        echo "Run this script using sudo."
-        exit 1
-    fi
-
-    if [[ -z "${SUDO_USER:-}" || "$SUDO_USER" == "root" ]]; then
-        fail "Run from a technician account using sudo."
-    fi
-
-    TECH_USER="$SUDO_USER"
-
-    info "Preparing persistent deployment session..."
-
+    (( EUID == 0 )) || fail "Start with: sudo bash install.sh"
+    [[ -n "${SUDO_USER:-}" && "$SUDO_USER" != root ]] || fail "Use sudo from a technician account."
+    [[ -t 0 ]] || fail "An interactive terminal is required."
     if ! command -v tmux >/dev/null 2>&1; then
         apt-get update
         DEBIAN_FRONTEND=noninteractive apt-get install -y tmux
     fi
-
-    success "tmux is available."
-
-    SCRIPT_PATH="$(realpath "$0")"
-
-    printf -v QUOTED_SCRIPT '%q' "$SCRIPT_PATH"
-
-    echo
-    echo "Starting persistent session: $SESSION_NAME"
-    echo
-    echo "If SSH disconnects, reconnect and run:"
-    echo
-    echo "tmux attach -t $SESSION_NAME"
-    echo
-
-    exec runuser -u "$TECH_USER" -- \
-    tmux new-session -A -s "$SESSION_NAME" \
-    "sudo env TMUX=\"\$TMUX\" bash $QUOTED_SCRIPT --inside-tmux"
+    SCRIPT="$(realpath "$0")"
+    printf -v SCRIPT_Q '%q' "$SCRIPT"
+    echo "Persistent session: $SESSION"
+    echo "After reconnecting: tmux attach -t $SESSION"
+    exec runuser -u "$SUDO_USER" -- tmux new-session -A -s "$SESSION" \
+        "sudo env TMUX=\"\$TMUX\" bash $SCRIPT_Q --inside-tmux"
 fi
 
-# ----------------------------------------------------------
-# Require root inside tmux
-# ----------------------------------------------------------
+(( EUID == 0 )) || fail "Root permissions required."
+[[ -n "${TMUX:-}" && -t 0 ]] || fail "Run inside the managed tmux session."
+install -m 600 /dev/null "$LOG" 2>/dev/null || true
+exec > >(tee -a "$LOG") 2>&1
+trap 'printf "[ERROR] Command failed at line %s. Review %s\n" "$LINENO" "$LOG" >&2' ERR
 
-if [[ "$EUID" -ne 0 ]]; then
-    fail "Administrative privileges are required."
-fi
-
-if [[ -z "${TMUX:-}" ]]; then
-    fail "Deployment must run inside tmux."
-fi
-
-if [[ ! -t 0 ]]; then
-    fail "An interactive terminal is required."
-fi
-
-touch "$LOG_FILE"
-chmod 600 "$LOG_FILE"
-
-exec > >(tee -a "$LOG_FILE") 2>&1
-
-echo
-echo "=================================================="
-echo "           APOLLO COMPUTERS"
-echo "         UNIFI SERVER DEPLOYMENT"
-echo "=================================================="
-echo
-echo "Deployment Version: $VERSION"
-echo "UniFi OS Server: $UNIFI_VERSION"
-echo "Persistent Session: $SESSION_NAME"
-echo
-
-# ----------------------------------------------------------
-# Verify operating system
-# ----------------------------------------------------------
+printf '\n==================================================\n'
+printf ' APOLLO COMPUTERS - UNIFI SERVER DEPLOYMENT\n'
+printf ' Version %s | UniFi OS Server %s\n' "$VERSION" "$UNIFI_VERSION"
+printf '==================================================\n\n'
 
 source /etc/os-release
+[[ "$ID" == ubuntu && "$VERSION_ID" == 24.04 ]] || fail "Ubuntu 24.04 is required."
+[[ "$(uname -m)" == x86_64 ]] || fail "x86_64 is required."
+pass "Supported operating system and architecture."
 
-[[ "$ID" == "ubuntu" && "$VERSION_ID" == "24.04" ]] \
-    || fail "Ubuntu Server 24.04 LTS is required."
+read -r -p "Client Name: " CLIENT
+[[ -n "${CLIENT//[[:space:]]/}" ]] || fail "Client name required."
+read -r -p "Server Hostname: " HOST
+[[ "$HOST" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$ ]] || fail "Invalid hostname."
 
-[[ "$(uname -m)" == "x86_64" ]] \
-    || fail "An x86_64 processor is required."
-
-success "Ubuntu 24.04 x86_64 verified."
-
-# ----------------------------------------------------------
-# Collect deployment information
-# ----------------------------------------------------------
-
-echo
-read -r -p "Client Name: " CLIENT_NAME
-read -r -p "Server Hostname: " SERVER_HOSTNAME
-
-[[ -n "$CLIENT_NAME" ]] || fail "Client name is required."
-
-if [[ ! "$SERVER_HOSTNAME" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$ ]]; then
-    fail "Invalid hostname."
-fi
-
-# ----------------------------------------------------------
-# Detect network interfaces
-# ----------------------------------------------------------
-
-info "Detecting network interfaces..."
-
-mapfile -t INTERFACES < <(
-    find /sys/class/net -mindepth 1 -maxdepth 1 \
-        -printf '%f\n' | grep -v '^lo$' | sort
-)
-
-[[ "${#INTERFACES[@]}" -gt 0 ]] \
-    || fail "No network interfaces detected."
-
-echo
-echo "Available network interfaces:"
-echo
-
-for i in "${!INTERFACES[@]}"; do
-    printf "%d) %s\n" "$((i + 1))" "${INTERFACES[$i]}"
-done
-
-echo
-
-while true; do
-    read -r -p "Select network interface number: " SELECTION
-
-    if [[ "$SELECTION" =~ ^[0-9]+$ ]] &&
-       (( 10#$SELECTION >= 1 &&
-          10#$SELECTION <= ${#INTERFACES[@]} )); then
-
-        NETWORK_INTERFACE="${INTERFACES[$((10#$SELECTION - 1))]}"
+mapfile -t IFACES < <(find /sys/class/net -mindepth 1 -maxdepth 1 -printf '%f\n' | grep -v '^lo$' | sort)
+(( ${#IFACES[@]} > 0 )) || fail "No network interfaces found."
+printf '\nNetwork interfaces:\n'
+for i in "${!IFACES[@]}"; do printf '%d) %s\n' "$((i+1))" "${IFACES[i]}"; done
+while :; do
+    read -r -p "Select interface number: " PICK
+    if [[ "$PICK" =~ ^[1-9][0-9]*$ ]] && (( ${#PICK} <= 3 )) && (( 10#$PICK <= ${#IFACES[@]} )); then
+        IFACE="${IFACES[$((10#$PICK-1))]}"
         break
     fi
-
     echo "Invalid selection."
 done
 
-success "Selected interface: $NETWORK_INTERFACE"
-
-# ----------------------------------------------------------
-# Select DHCP or static IP
-# ----------------------------------------------------------
-
-echo
-echo "NETWORK CONFIGURATION"
-echo "--------------------------------------------------"
-echo "1) DHCP"
-echo "2) Static IP"
-echo
-
-while true; do
-    read -r -p "Select network configuration (1/2): " CHOICE
-
-    case "$CHOICE" in
-        1) NETWORK_MODE="DHCP"; break ;;
-        2) NETWORK_MODE="STATIC"; break ;;
-        *) echo "Enter 1 or 2." ;;
-    esac
+printf '\n1) DHCP (leave existing network unchanged)\n2) Static IP\n'
+while :; do
+    read -r -p "Choose 1 or 2: " MODE
+    [[ "$MODE" == 1 || "$MODE" == 2 ]] && break
+    echo "Choose 1 or 2."
 done
 
-# ----------------------------------------------------------
-# IPv4 validation
-# ----------------------------------------------------------
-
-valid_ipv4() {
-    local ip="$1"
-    local octet
-    local -a octets
-
-    [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] \
-        || return 1
-
-    local IFS=.
-    read -r -a octets <<< "$ip"
-
-    for octet in "${octets[@]}"; do
-        [[ "$octet" =~ ^(0|[1-9][0-9]{0,2})$ ]] \
-            || return 1
-
-        (( octet <= 255 )) || return 1
+valid_ip() {
+    local addr="$1" part
+    local -a parts
+    [[ "$addr" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+    IFS=. read -r -a parts <<< "$addr"
+    for part in "${parts[@]}"; do
+        [[ "$part" =~ ^(0|[1-9][0-9]{0,2})$ ]] || return 1
+        (( 10#$part <= 255 )) || return 1
     done
 }
-
-read_ipv4() {
-    local prompt="$1"
-    local result_var="$2"
-    local value
-
-    while true; do
+ask_ip() {
+    local prompt="$1" target="$2" value
+    while :; do
         read -r -p "$prompt" value
-
-        if valid_ipv4 "$value"; then
-            printf -v "$result_var" '%s' "$value"
-            return
-        fi
-
+        if valid_ip "$value"; then printf -v "$target" '%s' "$value"; return; fi
         echo "Invalid IPv4 address."
     done
 }
 
-# ----------------------------------------------------------
-# Collect static IP settings
-# ----------------------------------------------------------
-
-if [[ "$NETWORK_MODE" == "STATIC" ]]; then
-
-    echo
-    echo "STATIC IP CONFIGURATION"
-    echo "--------------------------------------------------"
-
-    read_ipv4 "Static IP Address: " STATIC_IP
-
-    while true; do
-        read -r -p "Subnet Prefix (example 24): " PREFIX
-
-        if [[ "$PREFIX" =~ ^[0-9]+$ ]] &&
-           (( 10#$PREFIX >= 1 && 10#$PREFIX <= 32 )); then
-
+if [[ "$MODE" == 2 ]]; then
+    ask_ip "Static IP address: " STATIC_IP
+    while :; do
+        read -r -p "Subnet prefix (1-32): " PREFIX
+        if [[ "$PREFIX" =~ ^[1-9][0-9]?$ ]] && (( 10#$PREFIX <= 32 )); then
             PREFIX="$((10#$PREFIX))"
             break
         fi
-
-        echo "Enter a prefix between 1 and 32."
+        echo "Enter a number from 1 to 32."
     done
-
-    read_ipv4 "Default Gateway: " GATEWAY
-    read_ipv4 "Primary DNS: " DNS1
-    read_ipv4 "Secondary DNS: " DNS2
+    ask_ip "Default gateway: " GATEWAY
+    ask_ip "Primary DNS: " DNS1
+    ask_ip "Secondary DNS: " DNS2
 fi
 
-# ----------------------------------------------------------
-# Confirm deployment configuration
-# ----------------------------------------------------------
-
-echo
-echo "=================================================="
-echo "         DEPLOYMENT CONFIGURATION"
-echo "=================================================="
-echo
-echo "Client:    $CLIENT_NAME"
-echo "Hostname:  $SERVER_HOSTNAME"
-echo "Interface: $NETWORK_INTERFACE"
-echo "Network:   $NETWORK_MODE"
-
-if [[ "$NETWORK_MODE" == "STATIC" ]]; then
-    echo
-    echo "Static IP: $STATIC_IP/$PREFIX"
-    echo "Gateway:   $GATEWAY"
-    echo "DNS 1:     $DNS1"
-    echo "DNS 2:     $DNS2"
+printf '\nClient: %s\nHostname: %s\nInterface: %s\n' "$CLIENT" "$HOST" "$IFACE"
+if [[ "$MODE" == 2 ]]; then
+    printf 'Static: %s/%s | Gateway: %s | DNS: %s, %s\n' "$STATIC_IP" "$PREFIX" "$GATEWAY" "$DNS1" "$DNS2"
+else
+    echo "Network: DHCP (unchanged)"
 fi
+read -r -p "Proceed? (Y/N): " OK
+[[ "$OK" =~ ^[Yy]$ ]] || { echo "Cancelled."; exit 0; }
 
-echo
-echo "UniFi OS Server: $UNIFI_VERSION"
-echo "=================================================="
-echo
-
-read -r -p "Is this configuration correct? (Y/N): " CONFIRM
-
-[[ "$CONFIRM" =~ ^[Yy]$ ]] || {
-    echo "Deployment cancelled."
-    exit 0
-}
-
-# ----------------------------------------------------------
-# Static network configuration
-# ----------------------------------------------------------
-
-if [[ "$NETWORK_MODE" == "STATIC" ]]; then
-
-    info "Preparing static network configuration..."
-
-    command -v netplan >/dev/null 2>&1 \
-        || fail "Netplan is required."
-
-    # Only support simple, single-interface configurations
-    # in this testing version.
-
-    mapfile -t NETPLAN_FILES < <(
-        find /etc/netplan -maxdepth 1 \
-            -type f -name '*.yaml' -print
-    )
-
-    [[ "${#NETPLAN_FILES[@]}" -eq 1 ]] \
-        || fail "Multiple Netplan files detected. Manual review required."
-
-    NETPLAN_FILE="${NETPLAN_FILES[0]}"
-
+if [[ "$MODE" == 2 ]]; then
+    info "Preparing independently timed network rollback."
+    command -v netplan >/dev/null || fail "Netplan not installed."
+    command -v systemd-run >/dev/null || fail "systemd-run not installed."
+    [[ ! -e "$BACKUP" && ! -e "$NEW_CONFIG" ]] || fail "Previous network backup/config exists; manual review required."
     if command -v cloud-init >/dev/null 2>&1; then
-        CLOUD_STATUS="$(cloud-init status 2>/dev/null || true)"
-
-        [[ "$CLOUD_STATUS" == *"disabled"* ]] \
-            || fail "Cloud-init networking requires manual review."
+        [[ "$(cloud-init status 2>/dev/null || true)" == *disabled* ]] || fail "Cloud-init networking is enabled; manual review required."
     fi
-
-    # Only accept the simple DHCP configuration verified
-    # on our Ubuntu test VM.
-    if ! grep -Eq "^[[:space:]]+$NETWORK_INTERFACE:" "$NETPLAN_FILE" ||
-       ! grep -Eq '^[[:space:]]+dhcp4:[[:space:]]+true' "$NETPLAN_FILE" ||
-       grep -Eq '^[[:space:]]*(bridges|bonds|vlans|wifis|routes|addresses):' "$NETPLAN_FILE"; then
-
-        fail "Existing network configuration requires manual review."
+    mapfile -t CONFIGS < <(find /etc/netplan -maxdepth 1 -type f -name '*.yaml' -print)
+    (( ${#CONFIGS[@]} == 1 )) || fail "Expected exactly one Netplan YAML file; manual review required."
+    ORIGINAL="${CONFIGS[0]}"
+    [[ "$ORIGINAL" != "$NEW_CONFIG" ]] || fail "Apollo configuration already exists."
+    grep -Eq "^[[:space:]]+$IFACE:" "$ORIGINAL" || fail "Selected interface not present in Netplan."
+    grep -Eq '^[[:space:]]+dhcp4:[[:space:]]+true([[:space:]]|$)' "$ORIGINAL" || fail "Expected a simple DHCP configuration."
+    if grep -Eq '^[[:space:]]*(bridges|bonds|vlans|wifis|routes|addresses):' "$ORIGINAL"; then
+        fail "Complex Netplan configuration requires manual review."
     fi
+    systemctl is-active --quiet "$UNIT.timer" && fail "An existing rollback timer is active."
+    mkdir -p "$WORKDIR" "$BACKUP"
+    chmod 700 "$BACKUP"
+    cp -a "$ORIGINAL" "$BACKUP/original.yaml"
+    printf '%s\n' "$ORIGINAL" > "$BACKUP/original-path"
+    chmod 600 "$BACKUP/original-path"
+    rm -f "$MARKER"
 
-    BACKUP_DIR="$(mktemp -d /root/apollo-netplan-backup.XXXXXX)"
+    cat > "$ROLLBACK" <<'ROLLBACK_SCRIPT'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+BACKUP="/var/lib/apollo-unifi/network-backup"
+NEW_CONFIG="/etc/netplan/99-apollo-unifi.yaml"
+MARKER="/run/apollo-unifi-network-confirmed"
+[[ ! -e "$MARKER" ]] || exit 0
+[[ -f "$BACKUP/original.yaml" && -f "$BACKUP/original-path" ]] || { echo "Missing network backup" >&2; exit 1; }
+ORIGINAL="$(cat "$BACKUP/original-path")"
+case "$ORIGINAL" in /etc/netplan/*.yaml) ;; *) echo "Unsafe backup path" >&2; exit 1 ;; esac
+echo "Network not confirmed: restoring prior Netplan settings."
+rm -f "$NEW_CONFIG"
+cp -a "$BACKUP/original.yaml" "$ORIGINAL"
+netplan generate
+netplan apply
+echo "Rollback attempted; verify connectivity at console if needed."
+ROLLBACK_SCRIPT
+    chmod 700 "$ROLLBACK"
+    bash -n "$ROLLBACK" || fail "Rollback helper syntax check failed."
 
-    cp -a "$NETPLAN_FILE" "$BACKUP_DIR/original.yaml"
-
-    NEW_NETPLAN="/etc/netplan/99-apollo-unifi.yaml"
-
-    [[ ! -e "$NEW_NETPLAN" ]] \
-        || fail "Apollo Netplan configuration already exists."
-
-    echo
-    echo "=================================================="
-    echo "           NETWORK CHANGE WARNING"
-    echo "=================================================="
-    echo
-    echo "The server IP address may change."
-    echo
-    echo "Your SSH session may disconnect."
-    echo
-    echo "After reconnecting, run:"
-    echo
-    echo "tmux attach -t $SESSION_NAME"
-    echo
-    echo "Netplan will provide a 120-second confirmation"
-    echo "window and attempt rollback if not confirmed."
-    echo
-    echo "Have console access available for recovery."
-    echo
-
-    read -r -p "Apply static network settings? (Y/N): " APPLY
-
-    [[ "$APPLY" =~ ^[Yy]$ ]] \
-        || fail "Static network change cancelled."
-
-    cat > "$NEW_NETPLAN" <<EOF
+    # Stage configuration outside /etc/netplan so validation cannot accidentally activate it.
+    cat > "$BACKUP/new.yaml" <<EOF
 network:
   version: 2
   ethernets:
-    $NETWORK_INTERFACE:
+    $IFACE:
       dhcp4: false
       addresses:
         - $STATIC_IP/$PREFIX
@@ -400,200 +183,80 @@ network:
           - $DNS1
           - $DNS2
 EOF
+    chmod 600 "$BACKUP/new.yaml"
+    printf '\nWARNING: Network connectivity may be interrupted.\n'
+    printf 'Reconnect to %s, then run: tmux attach -t %s\n' "$STATIC_IP" "$SESSION"
+    printf 'An independent rollback will run after 5 minutes unless confirmed.\n'
+    printf 'Keep Hyper-V console access available during this test.\n\n'
+    read -r -p "Apply static network configuration? (Y/N): " APPLY
+    [[ "$APPLY" =~ ^[Yy]$ ]] || { echo "Cancelled without changing networking."; exit 0; }
 
-    chmod 600 "$NEW_NETPLAN"
+    systemd-run --unit="$UNIT" --on-active=300s --timer-property=AccuracySec=1s "$ROLLBACK"
+    systemctl is-active --quiet "$UNIT.timer" || fail "Rollback timer failed to start; network unchanged."
+    pass "Independent rollback timer scheduled."
 
-    mv "$NETPLAN_FILE" "$BACKUP_DIR/active-original.yaml"
-
+    # Once the timer exists, all failures leave recovery scheduled.
+    mv "$ORIGINAL" "$BACKUP/active-original.yaml"
+    cp -a "$BACKUP/new.yaml" "$NEW_CONFIG"
     if ! netplan generate; then
-        cp -a "$BACKUP_DIR/active-original.yaml" "$NETPLAN_FILE"
-        rm -f "$NEW_NETPLAN"
-        fail "Invalid network configuration. Original restored."
+        echo "Netplan validation failed; restoring immediately."
+        "$ROLLBACK"
+        fail "Invalid Netplan configuration."
+    fi
+    info "Applying static network settings..."
+    if ! netplan apply; then
+        echo "Netplan apply failed. Rollback timer remains active."
+        fail "Could not apply static network settings."
     fi
 
-    info "Applying static network configuration..."
-
-    if netplan try --timeout 120; then
-
-        success "Network configuration confirmed."
-
-    else
-
-        echo "[WARN] Network change was not confirmed."
-
-        cp -a "$BACKUP_DIR/active-original.yaml" "$NETPLAN_FILE"
-        rm -f "$NEW_NETPLAN"
-
-        netplan apply || true
-
-        fail "Network change cancelled. Original configuration restored."
-    fi
-
-    # Netplan try is not a substitute for console recovery.
-    # Verify connectivity before continuing.
-    info "Checking network connectivity..."
-
-    if ! ip -4 addr show dev "$NETWORK_INTERFACE" |
-         grep -Fq "$STATIC_IP/$PREFIX"; then
-
-        fail "Expected static IP was not detected."
-    fi
-
-    success "Static IP detected on $NETWORK_INTERFACE."
-
+    printf '\nConnect to the NEW address from another SSH connection.\n'
+    printf 'Then attach to this tmux session and type the new IP to confirm.\n'
+    printf 'Expected address: %s\n' "$STATIC_IP"
+    read -r -p "Enter the NEW IP after verifying SSH connectivity: " VERIFIED_IP
+    [[ "$VERIFIED_IP" == "$STATIC_IP" ]] || fail "Not confirmed; automatic rollback remains scheduled."
+    systemctl is-active --quiet "$UNIT.timer" || fail "Rollback timer expired or stopped; inspect network before proceeding."
+    ip -4 -o addr show dev "$IFACE" | awk '{print $4}' | grep -Fxq "$STATIC_IP/$PREFIX" || fail "Expected IP missing; rollback remains scheduled."
+    touch "$MARKER"
+    systemctl stop "$UNIT.timer"
+    pass "Network confirmed; rollback timer canceled."
 else
-
-    info "DHCP selected. Existing network settings unchanged."
-
+    info "DHCP selected; existing network configuration unchanged."
 fi
-
-# ----------------------------------------------------------
-# Configure hostname
-# ----------------------------------------------------------
 
 info "Configuring hostname..."
-
-hostnamectl set-hostname "$SERVER_HOSTNAME"
-
-success "Hostname configured."
-
-# ----------------------------------------------------------
-# Install UniFi dependencies
-# ----------------------------------------------------------
-
-info "Updating package information..."
-
-export DEBIAN_FRONTEND=noninteractive
-
-apt-get update
+hostnamectl set-hostname "$HOST"
 
 info "Installing UniFi dependencies..."
-
-apt-get install -y \
-    curl \
-    wget \
-    ca-certificates \
-    gnupg \
-    podman \
-    slirp4netns \
-    uidmap \
-    dbus-user-session
-
-success "UniFi dependencies installed."
-
-# ----------------------------------------------------------
-# Download UniFi OS Server
-# ----------------------------------------------------------
-
-info "Preparing UniFi installation..."
-
-mkdir -p "$INSTALL_DIR"
-
-UNIFI_INSTALLER="$INSTALL_DIR/unifi-os-server-installer"
-
+export DEBIAN_FRONTEND=noninteractive
+apt-get update
+apt-get install -y curl wget ca-certificates gnupg podman slirp4netns uidmap dbus-user-session
+mkdir -p "$WORKDIR"
+INSTALLER="$WORKDIR/unifi-os-server-installer"
 info "Downloading UniFi OS Server $UNIFI_VERSION..."
+curl -fL --retry 3 --connect-timeout 30 "$UNIFI_URL" -o "$INSTALLER"
+chmod 755 "$INSTALLER"
+info "Running Ubiquiti installer (confirmation may be required)..."
+"$INSTALLER"
 
-curl -fL \
-    --retry 3 \
-    --connect-timeout 30 \
-    "$UNIFI_URL" \
-    -o "$UNIFI_INSTALLER"
-
-chmod 755 "$UNIFI_INSTALLER"
-
-success "UniFi installer downloaded."
-
-# ----------------------------------------------------------
-# Install UniFi OS Server
-# ----------------------------------------------------------
-
-info "Starting UniFi OS Server installation..."
-
-echo
-echo "NOTE: Ubiquiti's installer may request confirmation."
-echo
-
-"$UNIFI_INSTALLER"
-
-success "UniFi installer completed."
-
-# ----------------------------------------------------------
-# Verify services
-# ----------------------------------------------------------
-
-info "Verifying UniFi services..."
-
-systemctl daemon-reload
-
-INSTALL_OK=true
-
+info "Checking UniFi services..."
+STATUS=0
 for SERVICE in uosserver.service uosserver-updater.service; do
-
-    if ! systemctl list-unit-files "$SERVICE" \
-        --no-legend | grep -q "^$SERVICE"; then
-
-        echo "[ERROR] $SERVICE was not found."
-        INSTALL_OK=false
-        continue
-    fi
-
-    systemctl enable "$SERVICE"
-    systemctl start "$SERVICE"
-
-    if systemctl is-active --quiet "$SERVICE"; then
-        success "$SERVICE is running."
+    if systemctl list-unit-files "$SERVICE" --no-legend | grep -Fq "$SERVICE"; then
+        systemctl enable "$SERVICE"
+        systemctl start "$SERVICE"
+        if systemctl is-active --quiet "$SERVICE"; then pass "$SERVICE is running"; else STATUS=1; echo "[ERROR] $SERVICE not active"; fi
     else
-        echo "[ERROR] $SERVICE is not running."
-        INSTALL_OK=false
+        STATUS=1
+        echo "[ERROR] $SERVICE not installed"
     fi
-
 done
-
-# ----------------------------------------------------------
-# Deployment summary
-# ----------------------------------------------------------
-
-SERVER_IP="$(ip -4 -o addr show dev "$NETWORK_INTERFACE" \
-    | awk '{print $4}' | cut -d/ -f1 | head -n1)"
-
-echo
-echo "=================================================="
-echo "          APOLLO DEPLOYMENT SUMMARY"
-echo "=================================================="
-echo
-echo "Client:    $CLIENT_NAME"
-echo "Hostname:  $SERVER_HOSTNAME"
-echo "Interface: $NETWORK_INTERFACE"
-echo "Network:   $NETWORK_MODE"
-echo "IP:        ${SERVER_IP:-Not detected}"
-echo "Ubuntu:    $VERSION_ID"
-echo "UniFi:     $UNIFI_VERSION"
-echo
-
-if [[ -n "$SERVER_IP" ]]; then
-    echo "UniFi Management URL:"
-    echo "https://${SERVER_IP}:11443/"
-fi
-
-echo
-echo "--------------------------------------------------"
-echo "REMAINING TASKS"
-echo "--------------------------------------------------"
-echo
-echo "[ ] Complete UniFi Site Manager registration"
-echo "[ ] Install Apollo Datto RMM agent"
-echo "[ ] Verify Datto agent and client assignment"
-echo "[ ] Verify UniFi after reboot"
-echo "[ ] Adopt client access points"
-echo
-echo "Deployment log: $LOG_FILE"
-echo
-
-if [[ "$INSTALL_OK" == true ]]; then
-    echo "DEPLOYMENT STATUS: SUCCESS"
-else
-    echo "DEPLOYMENT STATUS: SERVICE VERIFICATION FAILED"
-    exit 1
-fi
-
-echo "=================================================="
+IP="$(ip -4 -o addr show dev "$IFACE" | awk 'NR==1 {split($4,a,"/"); print a[1]}')"
+printf '\n==================================================\n'
+printf ' APOLLO DEPLOYMENT SUMMARY\n'
+printf ' Client: %s\n Hostname: %s\n IP: %s\n' "$CLIENT" "$HOST" "${IP:-not detected}"
+[[ -z "$IP" ]] || printf ' UniFi UI: https://%s:11443/\n' "$IP"
+printf ' Log: %s\n' "$LOG"
+printf '==================================================\n'
+printf 'Remaining: complete UniFi registration, install Datto RMM, verify reboot, adopt devices.\n'
+if (( STATUS != 0 )); then fail "UniFi service verification failed."; fi
+pass "UniFi deployment finished."
