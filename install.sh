@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # Apollo Computers - UniFi OS Server Deployment
-# Version 2.2 (testing): persistent tmux and timed network recovery
+# Version 2.3 (testing): verified connectivity and synchronized rollback
 # Target: Ubuntu 24.04 x86_64
 set -Eeuo pipefail
 
-VERSION="2.2"
+VERSION="2.3"
 UNIFI_VERSION="5.1.42"
 UNIFI_URL="https://fw-download.ubnt.com/data/unifi-os-server/5172-linux-x64-5.1.42-12e9e3cf-8f8b-4e54-928c-76b80a10c8a4.42-x64"
 SESSION="apollo-deploy"
@@ -122,51 +122,83 @@ read -r -p "Proceed? (Y/N): " OK
 [[ "$OK" =~ ^[Yy]$ ]] || { echo "Cancelled."; exit 0; }
 
 if [[ "$MODE" == 2 ]]; then
-    info "Preparing independently timed network rollback."
-    command -v netplan >/dev/null || fail "Netplan not installed."
-    command -v systemd-run >/dev/null || fail "systemd-run not installed."
-    [[ ! -e "$BACKUP" && ! -e "$NEW_CONFIG" ]] || fail "Previous network backup/config exists; manual review required."
+    info "Preparing protected network configuration."
+    for cmd in netplan systemd-run flock; do
+        command -v "$cmd" >/dev/null || fail "$cmd is required."
+    done
+    [[ ! -e "$BACKUP" && ! -e "$NEW_CONFIG" ]] || fail "Previous network backup/config exists; review before retrying."
     if command -v cloud-init >/dev/null 2>&1; then
-        [[ "$(cloud-init status 2>/dev/null || true)" == *disabled* ]] || fail "Cloud-init networking is enabled; manual review required."
+        [[ "$(cloud-init status 2>/dev/null || true)" == *disabled* ]] || fail "Cloud-init networking must be disabled."
     fi
     mapfile -t CONFIGS < <(find /etc/netplan -maxdepth 1 -type f -name '*.yaml' -print)
-    (( ${#CONFIGS[@]} == 1 )) || fail "Expected exactly one Netplan YAML file; manual review required."
+    (( ${#CONFIGS[@]} == 1 )) || fail "Expected one Netplan YAML file."
     ORIGINAL="${CONFIGS[0]}"
-    [[ "$ORIGINAL" != "$NEW_CONFIG" ]] || fail "Apollo configuration already exists."
-    grep -Eq "^[[:space:]]+$IFACE:" "$ORIGINAL" || fail "Selected interface not present in Netplan."
-    grep -Eq '^[[:space:]]+dhcp4:[[:space:]]+true([[:space:]]|$)' "$ORIGINAL" || fail "Expected a simple DHCP configuration."
+    grep -Eq "^[[:space:]]+$IFACE:" "$ORIGINAL" || fail "Interface not found in Netplan."
+    grep -Eq '^[[:space:]]+dhcp4:[[:space:]]+true([[:space:]]|$)' "$ORIGINAL" || fail "Expected DHCP configuration."
     if grep -Eq '^[[:space:]]*(bridges|bonds|vlans|wifis|routes|addresses):' "$ORIGINAL"; then
-        fail "Complex Netplan configuration requires manual review."
+        fail "Complex Netplan requires manual review."
     fi
-    systemctl is-active --quiet "$UNIT.timer" && fail "An existing rollback timer is active."
+    ! systemctl is-active --quiet "$UNIT.timer" || fail "Rollback timer already active."
     mkdir -p "$WORKDIR" "$BACKUP"
-    chmod 700 "$BACKUP"
+    chmod 700 "$WORKDIR" "$BACKUP"
     cp -a "$ORIGINAL" "$BACKUP/original.yaml"
     printf '%s\n' "$ORIGINAL" > "$BACKUP/original-path"
-    chmod 600 "$BACKUP/original-path"
+    printf '%s\n' "$STATIC_IP/$PREFIX" > "$BACKUP/expected-address"
+    printf '%s\n' "$IFACE" > "$BACKUP/interface"
+    chmod 600 "$BACKUP"/*
     rm -f "$MARKER"
 
     cat > "$ROLLBACK" <<'ROLLBACK_SCRIPT'
 #!/usr/bin/env bash
 set -Eeuo pipefail
-BACKUP="/var/lib/apollo-unifi/network-backup"
-NEW_CONFIG="/etc/netplan/99-apollo-unifi.yaml"
-MARKER="/run/apollo-unifi-network-confirmed"
-[[ ! -e "$MARKER" ]] || exit 0
-[[ -f "$BACKUP/original.yaml" && -f "$BACKUP/original-path" ]] || { echo "Missing network backup" >&2; exit 1; }
+BACKUP=/var/lib/apollo-unifi/network-backup
+MARKER=/run/apollo-unifi-network-confirmed
+exec 9>"$BACKUP/lock"
+flock -x 9
+[[ ! -e "$MARKER" ]] || { echo "Network confirmed; no rollback."; exit 0; }
+[[ -f "$BACKUP/original.yaml" && -f "$BACKUP/original-path" ]] || exit 1
 ORIGINAL="$(cat "$BACKUP/original-path")"
-case "$ORIGINAL" in /etc/netplan/*.yaml) ;; *) echo "Unsafe backup path" >&2; exit 1 ;; esac
-echo "Network not confirmed: restoring prior Netplan settings."
-rm -f "$NEW_CONFIG"
+case "$ORIGINAL" in /etc/netplan/*.yaml) ;; *) exit 1 ;; esac
+echo "Network unconfirmed: restoring prior configuration."
+rm -f /etc/netplan/99-apollo-unifi.yaml
 cp -a "$BACKUP/original.yaml" "$ORIGINAL"
 netplan generate
 netplan apply
-echo "Rollback attempted; verify connectivity at console if needed."
+echo "Rollback applied; verify connectivity."
 ROLLBACK_SCRIPT
     chmod 700 "$ROLLBACK"
-    bash -n "$ROLLBACK" || fail "Rollback helper syntax check failed."
 
-    # Stage configuration outside /etc/netplan so validation cannot accidentally activate it.
+    CONFIRM_SCRIPT="$WORKDIR/confirm-network.sh"
+    cat > "$CONFIRM_SCRIPT" <<'CONFIRM_SCRIPT_EOF'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+BACKUP=/var/lib/apollo-unifi/network-backup
+MARKER=/run/apollo-unifi-network-confirmed
+UNIT=apollo-unifi-network-rollback
+(( EUID == 0 )) || { echo "Run with sudo." >&2; exit 1; }
+exec 9>"$BACKUP/lock"
+flock -x 9
+[[ ! -e "$MARKER" ]] || { echo "Already confirmed."; exit 0; }
+systemctl is-active --quiet "$UNIT.timer" || { echo "Rollback timer is no longer pending." >&2; exit 1; }
+EXPECTED="$(cat "$BACKUP/expected-address")"
+IFACE="$(cat "$BACKUP/interface")"
+ip -4 -o addr show dev "$IFACE" | awk '{print $4}' | grep -Fxq "$EXPECTED" || { echo "Expected address not present." >&2; exit 1; }
+IP="${EXPECTED%%/*}"
+if [[ -n "${SSH_CONNECTION:-}" ]]; then
+    read -r _ _ LOCAL_IP _ <<< "$SSH_CONNECTION"
+    [[ "$LOCAL_IP" == "$IP" ]] || { echo "SSH is not connected to $IP." >&2; exit 1; }
+else
+    # Local physical/VM console confirmation must be explicitly requested.
+    [[ "${1:-}" == "--console" ]] || { echo "SSH connection evidence missing. Use --console only at the VM console." >&2; exit 1; }
+    [[ "$(tty)" == /dev/tty[0-9]* ]] || { echo "Console confirmation requires a local tty." >&2; exit 1; }
+fi
+touch "$MARKER"
+systemctl stop "$UNIT.timer"
+echo "Network verified; rollback canceled."
+CONFIRM_SCRIPT_EOF
+    chmod 700 "$CONFIRM_SCRIPT"
+    bash -n "$ROLLBACK" && bash -n "$CONFIRM_SCRIPT" || fail "Helper validation failed."
+
     cat > "$BACKUP/new.yaml" <<EOF
 network:
   version: 2
@@ -184,41 +216,43 @@ network:
           - $DNS2
 EOF
     chmod 600 "$BACKUP/new.yaml"
-    printf '\nWARNING: Network connectivity may be interrupted.\n'
-    printf 'Reconnect to %s, then run: tmux attach -t %s\n' "$STATIC_IP" "$SESSION"
-    printf 'An independent rollback will run after 5 minutes unless confirmed.\n'
-    printf 'Keep Hyper-V console access available during this test.\n\n'
+    printf '\nWARNING: SSH may disconnect. Five-minute automatic rollback will be scheduled.\n'
+    printf 'Reconnect via: ssh <technician>@%s\n' "$STATIC_IP"
+    printf 'Then, in the NEW SSH session, run:\n'
+    printf '  sudo env SSH_CONNECTION="$SSH_CONNECTION" %s\n' "$CONFIRM_SCRIPT"
+    printf 'After confirmation, resume with: tmux attach -t %s\n' "$SESSION"
+    printf 'For local console recovery, use the Hyper-V console.\n\n'
     read -r -p "Apply static network configuration? (Y/N): " APPLY
-    [[ "$APPLY" =~ ^[Yy]$ ]] || { echo "Cancelled without changing networking."; exit 0; }
+    [[ "$APPLY" =~ ^[Yy]$ ]] || { echo "Canceled; network unchanged."; exit 0; }
 
     systemd-run --unit="$UNIT" --on-active=300s --timer-property=AccuracySec=1s "$ROLLBACK"
-    systemctl is-active --quiet "$UNIT.timer" || fail "Rollback timer failed to start; network unchanged."
-    pass "Independent rollback timer scheduled."
-
-    # Once the timer exists, all failures leave recovery scheduled.
+    systemctl is-active --quiet "$UNIT.timer" || fail "Rollback timer failed; network unchanged."
+    pass "Independent rollback timer active."
     mv "$ORIGINAL" "$BACKUP/active-original.yaml"
     cp -a "$BACKUP/new.yaml" "$NEW_CONFIG"
     if ! netplan generate; then
-        echo "Netplan validation failed; restoring immediately."
-        "$ROLLBACK"
-        fail "Invalid Netplan configuration."
+        "$ROLLBACK" || true
+        fail "Netplan validation failed; rollback attempted."
     fi
-    info "Applying static network settings..."
+    info "Applying static IP..."
     if ! netplan apply; then
-        echo "Netplan apply failed. Rollback timer remains active."
-        fail "Could not apply static network settings."
+        echo "Apply failed; independent rollback remains scheduled."
+        fail "Static network apply failed."
     fi
 
-    printf '\nConnect to the NEW address from another SSH connection.\n'
-    printf 'Then attach to this tmux session and type the new IP to confirm.\n'
-    printf 'Expected address: %s\n' "$STATIC_IP"
-    read -r -p "Enter the NEW IP after verifying SSH connectivity: " VERIFIED_IP
-    [[ "$VERIFIED_IP" == "$STATIC_IP" ]] || fail "Not confirmed; automatic rollback remains scheduled."
-    systemctl is-active --quiet "$UNIT.timer" || fail "Rollback timer expired or stopped; inspect network before proceeding."
-    ip -4 -o addr show dev "$IFACE" | awk '{print $4}' | grep -Fxq "$STATIC_IP/$PREFIX" || fail "Expected IP missing; rollback remains scheduled."
-    touch "$MARKER"
-    systemctl stop "$UNIT.timer"
-    pass "Network confirmed; rollback timer canceled."
+    printf '\nTo CONFIRM, open a NEW SSH connection to %s and run:\n' "$STATIC_IP"
+    printf '  sudo env SSH_CONNECTION="$SSH_CONNECTION" %s\n' "$CONFIRM_SCRIPT"
+    printf 'Then reattach: tmux attach -t %s\n' "$SESSION"
+    printf 'If at the local console, run: sudo %s --console\n' "$CONFIRM_SCRIPT"
+    printf 'Waiting for verified connectivity (up to five minutes)...\n'
+    CONFIRMED=false
+    for (( i=0; i<310; i++ )); do
+        if [[ -e "$MARKER" ]]; then CONFIRMED=true; break; fi
+        if ! systemctl is-active --quiet "$UNIT.timer"; then break; fi
+        sleep 1
+    done
+    [[ "$CONFIRMED" == true ]] || fail "Network was not confirmed. Check rollback status at console."
+    pass "Network confirmed from a separate connection; rollback canceled."
 else
     info "DHCP selected; existing network configuration unchanged."
 fi
