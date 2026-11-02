@@ -82,8 +82,8 @@ if [[ "${1:-}" != "--inside-tmux" ]]; then
     echo
 
     exec runuser -u "$TECH_USER" -- \
-        tmux new-session -A -s "$SESSION_NAME" \
-        "sudo bash $QUOTED_SCRIPT --inside-tmux"
+    tmux new-session -A -s "$SESSION_NAME" \
+    "sudo env TMUX=\"\$TMUX\" bash $QUOTED_SCRIPT --inside-tmux"
 fi
 
 # ----------------------------------------------------------
