@@ -1,14 +1,17 @@
 #!/usr/bin/env bash
+# ============================================================
 # Apollo Computers - UniFi OS Server + Datto RMM Deployment
-# Version 2.6 | Ubuntu Server 24.04 LTS x86_64
+# Version 2.7
+# Supported OS: Ubuntu Server 24.04 LTS (x86_64)
+# ============================================================
 
 set -Eeuo pipefail
 
-VERSION="2.6"
+VERSION="2.7"
 UNIFI_VERSION="5.1.42"
+
 UNIFI_URL="https://fw-download.ubnt.com/data/unifi-os-server/5172-linux-x64-5.1.42-12e9e3cf-8f8b-4e54-928c-76b80a10c8a4.42-x64"
 
-SESSION="apollo-deploy"
 WORKDIR="/opt/apollo-unifi"
 LOG="/var/log/apollo-unifi-deployment.log"
 
@@ -16,6 +19,14 @@ STEP="Startup"
 UNIFI_STATUS="NOT RUN"
 RMM_STATUS="NOT RUN"
 FAILURES=0
+
+CLIENT=""
+HOST=""
+IP=""
+
+# ============================================================
+# OUTPUT FUNCTIONS
+# ============================================================
 
 info() {
     printf '\n[INFO] %s\n' "$*"
@@ -33,116 +44,67 @@ error() {
     printf '[ERROR] %s\n' "$*" >&2
 }
 
-# ==================================================
-# PERSISTENT SSH SESSION
-# ==================================================
+# ============================================================
+# ROOT VALIDATION
+# ============================================================
 
-if [[ "${1:-}" != "--inside-tmux" ]]; then
-
-    (( EUID == 0 )) || {
-        error "Run with sudo."
-        exit 1
-    }
-
-    [[ -n "${SUDO_USER:-}" && "$SUDO_USER" != root ]] || {
-        error "Run sudo from a technician account."
-        exit 1
-    }
-
-    [[ -t 0 ]] || {
-        error "An interactive SSH terminal is required."
-        exit 1
-    }
-
-    if ! command -v tmux >/dev/null 2>&1; then
-        apt-get update &&
-        DEBIAN_FRONTEND=noninteractive apt-get install -y tmux || exit 1
-    fi
-
-    SCRIPT="$(realpath "$0")"
-    printf -v SCRIPT_Q '%q' "$SCRIPT"
-
-    printf 'Persistent session: %s\n' "$SESSION"
-    printf 'After reconnecting: tmux attach -t %s\n' "$SESSION"
-
-    exec runuser -u "$SUDO_USER" -- tmux new-session -A -s "$SESSION" \
-        "sudo env TMUX=\"\$TMUX\" bash $SCRIPT_Q --inside-tmux"
+if (( EUID != 0 )); then
+    error "Run this script using sudo."
+    exit 1
 fi
 
-(( EUID == 0 )) || {
-    error "Root required."
-    exit 1
-}
-
-[[ -n "${TMUX:-}" && -t 0 ]] || {
-    error "Managed tmux session required."
-    exit 1
-}
+# ============================================================
+# LOGGING
+# ============================================================
 
 touch "$LOG"
 chmod 600 "$LOG"
 
 exec > >(tee -a "$LOG") 2>&1
 
-# ==================================================
+# ============================================================
 # ERROR HANDLING
-# ==================================================
+# ============================================================
 
-finish() {
-    local rc=$?
-
-    trap - EXIT
-
-    if (( rc != 0 )); then
-        printf '\n==================================================\n'
-        printf ' APOLLO DEPLOYMENT - STOPPED WITH ERROR\n'
-        printf ' Step: %s\n' "$STEP"
-        printf ' Exit code: %s\n' "$rc"
-        printf ' Log: %s\n' "$LOG"
-        printf '==================================================\n'
-
-        read -r -p 'Press Enter to close this session...' _ </dev/tty || true
-    fi
-}
-
-trap finish EXIT
-
-trap 'error "Step: $STEP | Line: $LINENO | Command: $BASH_COMMAND | Exit: $?"' ERR
+trap 'error "Unexpected error at line $LINENO (exit code $?). Command: $BASH_COMMAND"' ERR
 
 fatal() {
     error "$*"
+    error "Deployment stopped during: $STEP"
+    error "Log: $LOG"
     exit 1
 }
 
-# ==================================================
+# ============================================================
 # HEADER
-# ==================================================
+# ============================================================
 
 printf '\n==================================================\n'
-printf ' APOLLO COMPUTERS - UNIFI + RMM DEPLOYMENT\n'
-printf ' Version %s | UniFi OS Server %s\n' "$VERSION" "$UNIFI_VERSION"
+printf ' APOLLO COMPUTERS - SERVER DEPLOYMENT\n'
+printf ' Version: %s\n' "$VERSION"
+printf ' UniFi OS Server: %s\n' "$UNIFI_VERSION"
 printf '==================================================\n\n'
 
-# ==================================================
-# STAGE 0 - UBUNTU AND NETWORK VALIDATION
-# ==================================================
+# ============================================================
+# STAGE 0 - SYSTEM AND NETWORK VALIDATION
+# ============================================================
 
-STEP="Validating Ubuntu and network"
+STEP="System and network validation"
 
 source /etc/os-release
 
 [[ "$ID" == ubuntu && "$VERSION_ID" == 24.04 ]] ||
-    fatal "Ubuntu Server 24.04 is required."
+    fatal "Ubuntu Server 24.04 LTS is required."
 
 [[ "$(uname -m)" == x86_64 ]] ||
-    fatal "x86_64 is required."
+    fatal "This deployment requires x86_64 architecture."
 
 pass "Supported operating system and architecture."
 
-read -r -p 'Client Name: ' CLIENT
+read -r -p "Client Name: " CLIENT
 
 [[ -n "${CLIENT//[[:space:]]/}" ]] ||
-    fatal "Client name required."
+    fatal "Client name cannot be empty."
 
 CURRENT_HOST="$(hostnamectl --static 2>/dev/null || hostname)"
 
@@ -154,25 +116,34 @@ HOST="${HOST:-$CURRENT_HOST}"
     fatal "Invalid hostname."
 
 ROUTE="$(ip -4 route get 1.1.1.1 2>/dev/null)" ||
-    fatal "No IPv4 route. Configure Ubuntu networking first."
+    fatal "No IPv4 route detected. Configure networking first."
 
-IFACE="$(awk '{for(i=1;i<=NF;i++) if($i=="dev") {print $(i+1); exit}}' <<< "$ROUTE")"
+IFACE="$(
+    awk '{for(i=1;i<=NF;i++) if($i=="dev") {print $(i+1); exit}}' \
+    <<< "$ROUTE"
+)"
 
-IP="$(awk '{for(i=1;i<=NF;i++) if($i=="src") {print $(i+1); exit}}' <<< "$ROUTE")"
+IP="$(
+    awk '{for(i=1;i<=NF;i++) if($i=="src") {print $(i+1); exit}}' \
+    <<< "$ROUTE"
+)"
 
 [[ -n "$IFACE" && -n "$IP" ]] ||
-    fatal "No usable IPv4 interface/address detected."
+    fatal "No usable IPv4 address detected."
 
-printf '\nClient: %s\n' "$CLIENT"
+printf '\n'
+printf 'Client: %s\n' "$CLIENT"
 printf 'Hostname: %s\n' "$HOST"
 printf 'Interface: %s\n' "$IFACE"
 printf 'Current IP: %s\n' "$IP"
-printf 'Network: existing Ubuntu configuration (will not be modified)\n'
+printf 'Network: Existing Ubuntu configuration\n'
 
-# Automatically continue without asking for confirmation.
+# No confirmation prompt. Continue automatically.
 
 command -v curl >/dev/null 2>&1 ||
     fatal "curl is required."
+
+info "Checking internet connectivity..."
 
 curl -fsS \
     --connect-timeout 15 \
@@ -185,9 +156,10 @@ pass "Network connectivity available."
 
 if [[ "$CURRENT_HOST" != "$HOST" ]]; then
 
-    hostnamectl set-hostname "$HOST"
+    hostnamectl set-hostname "$HOST" ||
+        fatal "Failed to update hostname."
 
-    pass "Hostname set to $HOST."
+    pass "Hostname updated to $HOST."
 
 else
 
@@ -195,33 +167,39 @@ else
 
 fi
 
-# ==================================================
+# ============================================================
 # STAGE 1 - UNIFI OS SERVER
-# ==================================================
+# ============================================================
 
-install_unifi() (
-    set -Eeuo pipefail
-
-    STEP="UniFi OS Server"
+install_unifi() {
 
     local has_main=false
     local has_updater=false
 
-    systemctl cat uosserver.service >/dev/null 2>&1 &&
-        has_main=true
+    local service
+    local state
+    local code
+    local attempt
 
-    systemctl cat uosserver-updater.service >/dev/null 2>&1 &&
+    info "Checking UniFi OS Server installation..."
+
+    if systemctl cat uosserver.service >/dev/null 2>&1; then
+        has_main=true
+    fi
+
+    if systemctl cat uosserver-updater.service >/dev/null 2>&1; then
         has_updater=true
+    fi
 
     if [[ "$has_main" == true && "$has_updater" == true ]]; then
 
-        pass "Existing UniFi installation detected; skipping installer."
-
-        info "Installed version not independently verified; no upgrade attempted."
+        pass "Existing UniFi installation detected."
+        info "Skipping UniFi installer."
 
     elif [[ "$has_main" == true || "$has_updater" == true ]]; then
 
-        error "Partial UniFi installation detected; not overwriting it."
+        error "Partial UniFi installation detected."
+        error "Manual repair is required before continuing."
 
         return 1
 
@@ -243,7 +221,7 @@ install_unifi() (
             uidmap \
             dbus-user-session || return 1
 
-        install -d -m 755 "$WORKDIR" || return 1
+        mkdir -p "$WORKDIR" || return 1
 
         local installer="$WORKDIR/unifi-os-server-installer"
 
@@ -256,24 +234,27 @@ install_unifi() (
             -o "$installer" || return 1
 
         [[ -s "$installer" ]] || {
-            error "UniFi installer is empty."
+            error "Downloaded UniFi installer is empty."
             return 1
         }
 
         chmod 755 "$installer" || return 1
 
-        info "Running Ubiquiti installer (vendor prompts may appear)..."
+        info "Running UniFi OS Server installer..."
 
         "$installer" || return 1
 
     fi
 
-    local service
+    info "Checking UniFi services..."
 
-    for service in uosserver.service uosserver-updater.service; do
+    for service in \
+        uosserver.service \
+        uosserver-updater.service
+    do
 
         systemctl cat "$service" >/dev/null 2>&1 || {
-            error "$service missing."
+            error "$service is missing."
             return 1
         }
 
@@ -282,7 +263,7 @@ install_unifi() (
         systemctl start "$service" || return 1
 
         systemctl is-active --quiet "$service" || {
-            error "$service not running."
+            error "$service is not active."
             return 1
         }
 
@@ -292,11 +273,7 @@ install_unifi() (
 
     info "Waiting for UniFi container and HTTPS interface..."
 
-    local state
-    local code
-    local attempt
-
-    for (( attempt=1; attempt<=60; attempt++ )); do
+    for ((attempt=1; attempt<=60; attempt++)); do
 
         state="$(
             runuser -u uosserver -- sh -c \
@@ -316,7 +293,8 @@ install_unifi() (
 
         if [[ "$state" == true && "$code" =~ ^[23][0-9][0-9]$ ]]; then
 
-            pass "UniFi container and HTTPS UI ready (HTTP $code)."
+            pass "UniFi container running."
+            pass "UniFi HTTPS interface responding (HTTP $code)."
 
             return 0
 
@@ -326,27 +304,23 @@ install_unifi() (
 
     done
 
-    error "UniFi container/HTTPS UI did not become ready."
-
-    error "Inspect: sudo journalctl -u uosserver.service -n 80 --no-pager"
+    error "UniFi container or HTTPS interface did not become ready."
 
     return 1
-)
+}
 
-# ==================================================
+# ============================================================
 # STAGE 2 - DATTO RMM
-# ==================================================
+# ============================================================
 
-install_rmm() (
-    set -Eeuo pipefail
+install_rmm() {
 
-    STEP="Datto RMM"
-
-    # Never embed site enrollment tokens in public GitHub.
+    info "Checking Datto RMM installation..."
 
     if systemctl is-active --quiet cag.service; then
 
-        pass "Datto RMM agent service already active; not reinstalling."
+        pass "Datto RMM service already running."
+        info "Skipping RMM installation."
 
         return 0
 
@@ -354,61 +328,68 @@ install_rmm() (
 
     if systemctl cat cag.service >/dev/null 2>&1; then
 
-        info "Existing Datto RMM service detected; attempting to start it."
+        info "Existing Datto RMM service detected."
 
         systemctl enable cag.service || return 1
-
         systemctl start cag.service || return 1
 
-        systemctl is-active --quiet cag.service || {
-            error "cag.service is not active."
-            return 1
-        }
+        if systemctl is-active --quiet cag.service; then
 
-        pass "Datto RMM service active. Confirm device appears in RMM console."
+            pass "Datto RMM service started."
+            return 0
+
+        fi
+
+        error "Datto RMM service failed to start."
+        return 1
+
+    fi
+
+    printf '\n'
+    printf 'Datto RMM requires an approved Linux installer.\n'
+    printf 'Do not store Datto enrollment credentials in public GitHub.\n'
+
+    local rmm_file
+
+    read -r -p \
+        "Local path to approved Datto Linux installer (Enter to skip): " \
+        rmm_file
+
+    if [[ -z "$rmm_file" ]]; then
+
+        warn "Datto RMM installation skipped."
+        return 2
+
+    fi
+
+    if [[ ! -f "$rmm_file" ]]; then
+
+        error "Datto installer not found: $rmm_file"
+        return 1
+
+    fi
+
+    info "Installing Datto RMM..."
+
+    bash "$rmm_file" || return 1
+
+    if systemctl is-active --quiet cag.service; then
+
+        pass "Datto RMM service running."
+        info "Confirm the device appears in the Datto RMM console."
 
         return 0
 
     fi
 
-    printf '\nDatto RMM enrollment requires your approved, site-specific Linux installer.\n'
-    printf 'Do not put the enrollment URL or token into public GitHub.\n'
+    error "Datto RMM service is not running after installation."
 
-    read -r -p \
-        'Local path to approved Datto Linux installer (Enter to skip): ' \
-        RMM_FILE
+    return 1
+}
 
-    if [[ -z "$RMM_FILE" ]]; then
-
-        warn "Datto RMM not installed: no approved installer supplied."
-
-        return 2
-
-    fi
-
-    if [[ ! -f "$RMM_FILE" ]]; then
-
-        error "Datto installer file not found: $RMM_FILE"
-
-        return 1
-
-    fi
-
-    info "Running approved local Datto installer..."
-
-    bash "$RMM_FILE" || return 1
-
-    systemctl is-active --quiet cag.service || {
-        error "Datto agent service is not active after installation."
-        return 1
-    }
-
-    pass "Datto RMM service active. Confirm enrollment in RMM console."
-)
-
-# ==================================================
-# RUN INDEPENDENT INSTALLATION STAGES
-# ==================================================
+# ============================================================
+# RUN DEPLOYMENT STAGES INDEPENDENTLY
+# ============================================================
 
 STEP="UniFi OS Server"
 
@@ -422,9 +403,10 @@ else
 
     UNIFI_STATUS="FAILED"
 
-    (( FAILURES+=1 ))
+    ((FAILURES+=1))
 
-    error "UniFi stage failed; proceeding to RMM."
+    error "UniFi deployment failed."
+    warn "Continuing to Datto RMM installation."
 
 fi
 
@@ -438,63 +420,90 @@ if install_rmm; then
 
 else
 
-    rc=$?
+    RC=$?
 
-    if (( rc == 2 )); then
+    if (( RC == 2 )); then
 
-        RMM_STATUS="SKIPPED (installer not supplied)"
+        RMM_STATUS="SKIPPED"
 
     else
 
         RMM_STATUS="FAILED"
 
-        (( FAILURES+=1 ))
+        ((FAILURES+=1))
 
     fi
 
 fi
 
-# ==================================================
+# ============================================================
 # DEPLOYMENT SUMMARY
-# ==================================================
+# ============================================================
 
 STEP="Deployment summary"
 
-printf '\n==================================================\n'
-printf ' APOLLO DEPLOYMENT SUMMARY\n'
-printf ' Client: %s\n' "$CLIENT"
-printf ' Hostname: %s\n' "$HOST"
-printf ' IP: %s\n' "$IP"
-printf ' UniFi OS Server: %s\n' "$UNIFI_STATUS"
-printf ' Datto RMM: %s\n' "$RMM_STATUS"
+printf '\n'
+printf '==================================================\n'
+printf ' APOLLO COMPUTERS - DEPLOYMENT SUMMARY\n'
+printf '==================================================\n'
+
+printf 'Client:           %s\n' "$CLIENT"
+printf 'Hostname:         %s\n' "$HOST"
+printf 'IP Address:       %s\n' "$IP"
+
+printf '\n'
+printf 'UniFi OS Server:  %s\n' "$UNIFI_STATUS"
+printf 'Datto RMM:        %s\n' "$RMM_STATUS"
 
 if [[ "$UNIFI_STATUS" == PASS ]]; then
 
-    printf ' UniFi UI: https://%s:11443/\n' "$IP"
+    printf '\n'
+    printf 'UniFi Management:\n'
+    printf 'https://%s:11443/\n' "$IP"
 
 fi
 
-printf ' Log: %s\n' "$LOG"
+printf '\n'
+printf 'Deployment Log:\n'
+printf '%s\n' "$LOG"
+
+printf '\n'
 printf '==================================================\n'
 
-printf 'Remaining: complete UniFi registration, confirm Datto enrollment, verify reboot, adopt devices.\n'
+# ============================================================
+# FINAL STATUS
+# ============================================================
 
 if (( FAILURES > 0 )); then
 
-    error "Deployment completed with $FAILURES failed component(s)."
+    error "DEPLOYMENT COMPLETED WITH $FAILURES ERROR(S)."
 
-    read -r -p 'Press Enter to close this session...' _ </dev/tty || true
+    printf '\n'
+    printf 'Review the errors above or check the deployment log.\n'
+    printf '\n'
 
     exit 1
 
 fi
 
-if [[ "$RMM_STATUS" == SKIPPED* ]]; then
+if [[ "$RMM_STATUS" == "SKIPPED" ]]; then
 
-    warn "UniFi completed, but RMM installation was skipped."
+    warn "UniFi deployment completed. Datto RMM was skipped."
 
 else
 
-    pass "UniFi and RMM stages completed."
+    pass "UniFi and Datto RMM deployment stages completed."
 
 fi
+
+printf '\n'
+printf 'Remaining tasks:\n'
+printf ' - Complete UniFi registration\n'
+printf ' - Confirm Datto RMM enrollment\n'
+printf ' - Verify services after reboot\n'
+printf ' - Adopt UniFi devices\n'
+
+printf '\n'
+pass "Deployment script finished."
+
+exit 0
