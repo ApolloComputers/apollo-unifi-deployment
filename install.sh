@@ -2,11 +2,6 @@
 # ============================================================
 # Apollo Computers - UniFi OS Server + Datto RMM Deployment
 # Version 2.9
-#
-# Usage:
-#   sudo bash install.sh
-#   sudo bash install.sh --rmm-url "https://zinfandel.rmm.datto.com/download-agent/linux/<site-id>"
-#   sudo bash install.sh --rmm-url <site-id>
 # Supported OS: Ubuntu Server 24.04 LTS (x86_64)
 # ============================================================
 
@@ -25,10 +20,6 @@ STEP="Startup"
 
 UNIFI_STATUS="NOT RUN"
 RMM_STATUS="NOT RUN"
-
-# Apollo's Datto RMM platform (used when only a site ID is entered).
-RMM_PLATFORM="zinfandel"
-RMM_URL_ARG=""
 
 FAILURES=0
 
@@ -55,31 +46,6 @@ warn() {
 error() {
     printf '[ERROR] %s\n' "$*" >&2
 }
-
-# ============================================================
-# ARGUMENTS
-# ============================================================
-
-while [[ $# -gt 0 ]]; do
-    case "$1" in
-        --rmm-url)
-            RMM_URL_ARG="${2:-}"
-            shift 2 || shift
-            ;;
-        --rmm-url=*)
-            RMM_URL_ARG="${1#*=}"
-            shift
-            ;;
-        -h|--help)
-            printf 'Usage: sudo bash %s [--rmm-url <Datto RMM Linux URL or site ID>]\n' "$0"
-            exit 0
-            ;;
-        *)
-            printf '[ERROR] Unknown option: %s\n' "$1" >&2
-            exit 1
-            ;;
-    esac
-done
 
 # ============================================================
 # ROOT VALIDATION
@@ -408,70 +374,18 @@ install_rmm() {
     printf 'Copy the Linux agent download URL.\n'
     printf '\n'
     printf 'Paste ONLY the URL, not the entire wget command.\n'
-    printf 'If you cannot paste, type just the site ID - the code\n'
-    printf 'after /download-agent/linux/ in the URL.\n'
     printf '\n'
     printf 'Press Enter without a URL to skip installation.\n'
     printf '\n'
 
-    # The input is visible on screen so it can be checked, but it is
-    # not written to the log: typed characters are echoed by the
-    # terminal (not through the tee'd stdout), and the confirmation
-    # is printed straight to /dev/tty.
+    # Visible input so the URL can be checked as it is pasted or typed.
 
-    local confirm=""
+    read -r -p "Datto RMM URL: " rmm_url
 
-    if [[ -n "$RMM_URL_ARG" ]]; then
+    if [[ -z "$rmm_url" ]]; then
 
-        rmm_url="${RMM_URL_ARG//[[:space:]]/}"
-        if [[ "$rmm_url" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]; then
-            rmm_url="https://${RMM_PLATFORM}.rmm.datto.com/download-agent/linux/${rmm_url}"
-        fi
-        info "Using Datto RMM URL supplied with --rmm-url."
-
-    else
-
-        while :; do
-
-            attempt=$((attempt + 1))
-
-            read -r -p "Datto RMM URL or site ID (Enter to skip): " rmm_url
-            rmm_url="${rmm_url//[[:space:]]/}"
-
-            if [[ -z "$rmm_url" ]]; then
-                warn "Datto RMM installation skipped."
-                return 2
-            fi
-
-            # Site ID only -> build the full URL for Apollo's platform.
-            if [[ "$rmm_url" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]; then
-                rmm_url="https://${RMM_PLATFORM}.rmm.datto.com/download-agent/linux/${rmm_url}"
-            fi
-
-            if [[ "$rmm_url" =~ ^https://[a-zA-Z0-9-]+\.rmm\.datto\.com/download-agent/linux/[a-zA-Z0-9-]+/?$ ]]; then
-
-                printf '\nInstaller URL:\n  %s\n\n' "$rmm_url" > /dev/tty
-                read -r -p "Is this the correct Datto RMM site for ${CLIENT}? [y/N]: " confirm
-
-                if [[ "$confirm" =~ ^[Yy]$ ]]; then
-                    break
-                fi
-
-            else
-
-                error "That is not a Datto RMM Linux download URL or site ID."
-
-            fi
-
-            if (( attempt >= 3 )); then
-                error "No valid Datto RMM URL after 3 attempts."
-                unset rmm_url
-                return 1
-            fi
-
-            info "Try again (attempt $((attempt + 1)) of 3)."
-
-        done
+        warn "Datto RMM installation skipped."
+        return 2
 
     fi
 
